@@ -1,0 +1,2324 @@
+local src = [=[
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if env.__DroneCleanup then
+	pcall(env.__DroneCleanup)
+end
+local handoff = env.__DroneHandoff
+env.__DroneHandoff = nil
+
+local CONFIG = {
+	Speed = 40,
+	Boost = 2,
+	Smoothing = 6,
+	TouchSensitivity = 0.0045,
+	MouseSensitivity = 0.0035,
+	SensMin = 0.2,
+	SensMax = 3,
+	MaxPitch = math.rad(85),
+	MaxTilt = math.rad(25),
+	DefaultFOV = 80,
+	ZoomLevels = { 1, 2, 3.5 },
+	ChaseDistance = 10,
+	Collision = true,
+
+	-- Hitbox: yaw-aligned box for the fuselage + one box around each arm/rotor
+	HitBodySize = Vector3.new(1.9, 1.5, 2.5),
+	HitBodyOffset = Vector3.new(0, -0.1, 0),
+	HitRotorSize = Vector3.new(2.9, 1.0, 2.9),
+	HitRotorOffsetY = 0.3,
+	HitRotorXZ = 1.8,
+	HitInflate = 0.1,
+	GroundProbe = 30,
+
+	-- Auto landing: stop near the ground -> drone settles, rotors spin down
+	AutoLand = true,
+	LandHeight = 2.5,
+	LandDelay = 0.6,
+	LandSpeed = 3,
+	RotorSpinUp = 2.6,
+	RotorSpinDown = 1.2,
+
+	-- Companion (follow) mode
+	FollowDistance = 6,
+	FollowHeight = 4.5,
+	FollowSide = 2.5,
+	FollowMaxSpeed = 90,
+	FollowGain = 3.5,
+	FollowLeash = 80,
+	FollowPitch = math.rad(-12),
+	LightKey = Enum.KeyCode.L,
+
+	-- Parking / recall
+	ParkDistance = 45,
+	RecallSpeed = 200,
+	RecallArrive = 7,
+	RecallTimeout = 30,
+
+	-- Pathfinding (Theta* on a coarse 3D grid)
+	PathCell = 8,
+	PathBox = Vector3.new(6.6, 2.2, 6.6),
+	PathRadius = 3.3,
+	PathMargin = 60,
+	PathMaxNodes = 900,
+	PathMaxSeconds = 5,
+	WaypointRadius = 4,
+	ReplanDistance = 14,
+	ReplanInterval = 4,
+
+	-- Machine guns (visual only)
+	FireKey = Enum.KeyCode.F,
+	FireRate = 0.05,
+	BulletSpeed = 420,
+	FireRange = 700,
+	Spread = 0.006,
+	MaxTracers = 60,
+
+	SoundIds = { "rbxasset://sounds/snap.mp3", "rbxasset://sounds/clickfast.wav" },
+	SoundSpeedMin = 1.5,
+	SoundSpeedMax = 1.9,
+	SoundLevels = { 0, 0.15, 0.3 },
+	SoundLevelNames = { "OFF", "LOW", "MED" },
+}
+
+local ACCENT = Color3.fromRGB(70, 225, 255)
+local DANGER = Color3.fromRGB(255, 85, 95)
+local BASE = Color3.fromRGB(16, 20, 30)
+local WHITE = Color3.fromRGB(235, 243, 250)
+local SHELL = Color3.fromRGB(232, 236, 242)
+local GRAPHITE = Color3.fromRGB(40, 43, 52)
+local GRAPHITE_LIGHT = Color3.fromRGB(62, 66, 78)
+local GLASS = Color3.fromRGB(18, 26, 36)
+local BULLET_HOT = Color3.fromRGB(255, 240, 190)
+local BULLET_WARM = Color3.fromRGB(255, 130, 30)
+local PARTICLE_TEX = "rbxasset://textures/particles/sparkles_main.dds"
+
+local destroyed, exiting, released = false, false, false
+local mode = "pilot"
+local fstate = "follow"
+local conns = {}
+local pilotConns = {}
+local held = { fwd = false, back = false, left = false, right = false, up = false, down = false, fire = false }
+local lookTouch = nil
+local rmbDown = false
+local firstPerson = true
+local lightMode = (handoff and handoff.lightMode) or 2
+local soundLevel = (handoff and handoff.soundLevel) or 2
+local sens = (handoff and handoff.sens) or 1
+local sensKnob, sensFill, sensValue, sensDrag
+local boostOn = false
+local zoomIndex = 1
+local fov = CONFIG.DefaultFOV
+local fovBoost = 0
+local savedFov = camera.FieldOfView
+local startTime = os.clock()
+local hudTimer, followUiTimer = 0, 0
+
+local hrp = (player.Character or player.CharacterAdded:Wait()):FindFirstChild("HumanoidRootPart")
+
+local pos, vel = Vector3.zero, Vector3.zero
+local yaw, pitch = 0, 0
+
+-- Landing / rotor state (power = 0..1 fraction of full rotor speed)
+local land = { landed = false, landing = false, idle = 0, power = handoff and 1 or 0 }
+
+-- Navigation state
+local nav = {
+	path = nil, idx = 2, goal = nil, busy = false, token = 0, lastPlan = -10,
+	direct = false, lastDirect = -10, recallStart = 0, progPos = Vector3.zero, progT = 0,
+	stuck = 0, lastSkip = 0, blocked = 0, marginBonus = 0, active = false,
+}
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+local pathParams = RaycastParams.new()
+pathParams.FilterType = Enum.RaycastFilterType.Exclude
+pathParams.RespectCanCollide = true
+
+local aimParams = RaycastParams.new()
+aimParams.FilterType = Enum.RaycastFilterType.Exclude
+aimParams.RespectCanCollide = false
+
+----------------------------------------------------------------------
+-- Model
+----------------------------------------------------------------------
+local model = Instance.new("Model")
+model.Name = "DroneModel"
+
+local statics, rotors, gimbalParts, discs, accents, navLeds, muzzles = {}, {}, {}, {}, {}, {}, {}
+local headlight, headBulb, lensGlass, hullPart
+local GIMBAL_REL = CFrame.new(0, -0.5, -0.95)
+
+local function mk(name, size, color, material, shape)
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Size = size
+	p.Color = color
+	p.Material = material or Enum.Material.SmoothPlastic
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	if shape then
+		p.Shape = shape
+	end
+	p.Parent = model
+	return p
+end
+
+local function newEmitter(parent, o)
+	local e = Instance.new("ParticleEmitter")
+	e.Texture = PARTICLE_TEX
+	e.Color = ColorSequence.new(o.c0 or BULLET_HOT, o.c1 or BULLET_WARM)
+	e.LightEmission = 1
+	e.LightInfluence = 0
+	e.Rate = o.rate or 0
+	e.Lifetime = NumberRange.new(o.l0, o.l1 or o.l0)
+	e.Speed = NumberRange.new(o.s0 or 0, o.s1 or o.s0 or 0)
+	e.Size = NumberSequence.new(o.size, 0)
+	e.Transparency = NumberSequence.new(0, 1)
+	e.SpreadAngle = Vector2.new(o.spread or 0, o.spread or 0)
+	e.EmissionDirection = Enum.NormalId.Front
+	e.Acceleration = o.acc or Vector3.zero
+	e.Rotation = NumberRange.new(0, 360)
+	e.Parent = parent
+	return e
+end
+
+do
+	local function static(name, size, rel, color, material, shape)
+		local p = mk(name, size, color, material, shape)
+		statics[#statics + 1] = { p, rel }
+		return p
+	end
+	local function ellipsoid(name, size, rel, color, material)
+		local p = static(name, size, rel, color, material)
+		local m = Instance.new("SpecialMesh")
+		m.MeshType = Enum.MeshType.Sphere
+		m.Parent = p
+		return p
+	end
+	local function vcyl(name, h, d, pos3, color, material)
+		return static(name, Vector3.new(h, d, d), CFrame.new(pos3) * CFrame.Angles(0, 0, math.rad(90)), color, material, Enum.PartType.Cylinder)
+	end
+	local function zcyl(name, len, d, pos3, color, material)
+		return static(name, Vector3.new(len, d, d), CFrame.new(pos3) * CFrame.Angles(0, math.rad(90), 0), color, material, Enum.PartType.Cylinder)
+	end
+	local function strut(name, a, b, thick, color)
+		return static(name, Vector3.new(thick, thick, (b - a).Magnitude), CFrame.lookAt((a + b) / 2, b), color, Enum.Material.Metal)
+	end
+
+	static("Hull", Vector3.new(1.5, 0.34, 2.1), CFrame.new(0, -0.12, 0), GRAPHITE)
+	ellipsoid("Shell", Vector3.new(1.55, 0.62, 2.2), CFrame.new(0, 0.1, 0.02), SHELL)
+	static("Battery", Vector3.new(0.86, 0.2, 0.95), CFrame.new(0, 0.36, 0.38), GRAPHITE)
+	accents[#accents + 1] = static("BatteryStripe", Vector3.new(0.5, 0.03, 0.18), CFrame.new(0, 0.47, 0.38), ACCENT)
+	vcyl("GPS", 0.08, 0.34, Vector3.new(0, 0.44, -0.2), SHELL)
+
+	for _, sx in ipairs({ -1, 1 }) do
+		accents[#accents + 1] = static("SideStripe", Vector3.new(0.04, 0.07, 1.5), CFrame.new(sx * 0.76, -0.12, 0.05), ACCENT)
+		static("Sensor", Vector3.new(0.28, 0.12, 0.06), CFrame.new(sx * 0.42, -0.1, -1.07), GLASS)
+		static("Antenna", Vector3.new(0.8, 0.06, 0.06),
+			CFrame.new(sx * 0.45, 0.8, 0.85) * CFrame.Angles(math.rad(14), 0, 0) * CFrame.Angles(0, 0, math.rad(90)),
+			GRAPHITE, nil, Enum.PartType.Cylinder)
+		for _, sz in ipairs({ -1, 1 }) do
+			strut("Leg", Vector3.new(sx * 0.5, -0.22, sz * 0.65), Vector3.new(sx * 0.95, -0.78, sz * 0.65), 0.1, GRAPHITE_LIGHT)
+		end
+		zcyl("Skid", 2.5, 0.13, Vector3.new(sx * 0.95, -0.8, 0), GRAPHITE, Enum.Material.Metal)
+	end
+
+	local tail = static("TailBar", Vector3.new(0.9, 0.06, 0.05), CFrame.new(0, -0.1, 1.07), Color3.fromRGB(255, 50, 50), Enum.Material.Neon)
+	navLeds[#navLeds + 1] = { part = tail, light = nil, kind = "steady" }
+	local beacon = static("Beacon", Vector3.new(0.16, 0.16, 0.16), CFrame.new(0, -0.33, 0.6), Color3.fromRGB(255, 50, 50), Enum.Material.Neon, Enum.PartType.Ball)
+	navLeds[#navLeds + 1] = { part = beacon, light = nil, kind = "beacon" }
+
+	local corners = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } }
+	for i, c in ipairs(corners) do
+		local sx, sz = c[1], c[2]
+		local px, pz = sx * 1.8, sz * 1.8
+
+		static("Arm" .. i, Vector3.new(0.26, 0.16, 1.9),
+			CFrame.lookAt(Vector3.new(sx * 1.15, 0.02, sz * 1.15), Vector3.new(px, 0.02, pz)),
+			GRAPHITE_LIGHT, Enum.Material.Metal)
+		ellipsoid("Joint" .. i, Vector3.new(0.7, 0.34, 0.7), CFrame.new(sx * 0.62, 0.05, sz * 0.62), SHELL)
+
+		vcyl("Motor" .. i, 0.42, 0.54, Vector3.new(px, 0.17, pz), GRAPHITE, Enum.Material.Metal)
+		vcyl("Bell" .. i, 0.1, 0.44, Vector3.new(px, 0.42, pz), Color3.fromRGB(170, 175, 185), Enum.Material.Metal)
+		vcyl("Hub" .. i, 0.14, 0.2, Vector3.new(px, 0.55, pz), SHELL, Enum.Material.Metal)
+
+		local ringColor, kind
+		if sz < 0 then
+			ringColor = (sx < 0) and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(50, 255, 100)
+			kind = "steady"
+		else
+			ringColor = Color3.fromRGB(245, 245, 255)
+			kind = "strobe"
+		end
+		local ring = vcyl("Ring" .. i, 0.07, 0.66, Vector3.new(px, 0.02, pz), ringColor, Enum.Material.Neon)
+		navLeds[#navLeds + 1] = { part = ring, light = nil, kind = kind }
+
+		local pitchA, pitchB = math.rad(10), math.rad(-10)
+		local blades = {
+			{ mk("BladeA" .. i, Vector3.new(1.5, 0.04, 0.3), Color3.fromRGB(24, 24, 28)), CFrame.new(0.8, 0, 0) * CFrame.Angles(pitchA, 0, 0) },
+			{ mk("BladeB" .. i, Vector3.new(1.5, 0.04, 0.3), Color3.fromRGB(24, 24, 28)), CFrame.new(-0.8, 0, 0) * CFrame.Angles(pitchB, 0, 0) },
+			{ mk("TipA" .. i, Vector3.new(0.16, 0.045, 0.3), ACCENT), CFrame.new(1.58, 0, 0) * CFrame.Angles(pitchA, 0, 0) },
+			{ mk("TipB" .. i, Vector3.new(0.16, 0.045, 0.3), ACCENT), CFrame.new(-1.58, 0, 0) * CFrame.Angles(pitchB, 0, 0) },
+		}
+		rotors[#rotors + 1] = { parts = blades, rel = CFrame.new(px, 0.58, pz), dir = (sx * sz > 0) and 1 or -1, angle = 0 }
+
+		local disc = static("Disc" .. i, Vector3.new(0.02, 3.3, 3.3), CFrame.new(px, 0.6, pz) * CFrame.Angles(0, 0, math.rad(90)),
+			Color3.fromRGB(205, 215, 225), nil, Enum.PartType.Cylinder)
+		disc.Transparency = 1
+		discs[#discs + 1] = disc
+	end
+
+	static("GimbalMount", Vector3.new(0.78, 0.1, 0.42), CFrame.new(0, -0.22, -0.95), GRAPHITE_LIGHT, Enum.Material.Metal)
+	for _, sx in ipairs({ -1, 1 }) do
+		static("Yoke", Vector3.new(0.07, 0.4, 0.16), CFrame.new(sx * 0.36, -0.4, -0.95), GRAPHITE_LIGHT, Enum.Material.Metal)
+	end
+
+	local function gimbalPart(p, rel)
+		gimbalParts[#gimbalParts + 1] = { p, rel }
+		return p
+	end
+	local function gz(name, len, d, z, color, material)
+		return gimbalPart(mk(name, Vector3.new(len, d, d), color, material, Enum.PartType.Cylinder),
+			CFrame.new(0, 0, z) * CFrame.Angles(0, math.rad(90), 0))
+	end
+
+	gimbalPart(mk("CamBody", Vector3.new(0.46, 0.4, 0.5), GRAPHITE_LIGHT), CFrame.new())
+	for _, sx in ipairs({ -1, 1 }) do
+		gimbalPart(mk("Pin", Vector3.new(0.1, 0.16, 0.16), SHELL, Enum.Material.Metal, Enum.PartType.Cylinder), CFrame.new(sx * 0.27, 0, 0))
+	end
+	gz("Barrel", 0.2, 0.3, -0.34, GRAPHITE, Enum.Material.Metal)
+	gz("LensRing", 0.05, 0.34, -0.45, ACCENT, Enum.Material.SmoothPlastic)
+	lensGlass = gz("LensGlass", 0.03, 0.24, -0.47, Color3.fromRGB(28, 120, 190), Enum.Material.Neon)
+
+	headBulb = gimbalPart(mk("Headlight", Vector3.new(0.34, 0.06, 0.07), Color3.fromRGB(255, 244, 214), Enum.Material.Neon),
+		CFrame.new(0, -0.24, -0.2))
+	headlight = Instance.new("SpotLight")
+	headlight.Face = Enum.NormalId.Front
+	headlight.Color = Color3.fromRGB(255, 244, 214)
+	headlight.Range = 70
+	headlight.Angle = 80
+	headlight.Brightness = 6
+	headlight.Parent = headBulb
+
+	-- Mini machine guns on each side of the gimbal
+	local GUN_X, GUN_Y = 0.5, -0.12
+	for i, sx in ipairs({ -1, 1 }) do
+		local function gcyl(name, len, d, z, color, material)
+			return gimbalPart(mk(name .. i, Vector3.new(len, d, d), color, material, Enum.PartType.Cylinder),
+				CFrame.new(sx * GUN_X, GUN_Y, z) * CFrame.Angles(0, math.rad(90), 0))
+		end
+		gimbalPart(mk("GunBracket" .. i, Vector3.new(0.1, 0.1, 0.16), GRAPHITE_LIGHT, Enum.Material.Metal),
+			CFrame.new(sx * 0.45, GUN_Y, -0.05))
+		gimbalPart(mk("GunHousing" .. i, Vector3.new(0.14, 0.16, 0.4), GRAPHITE, Enum.Material.Metal),
+			CFrame.new(sx * GUN_X, GUN_Y, -0.2))
+		gimbalPart(mk("GunAmmo" .. i, Vector3.new(0.1, 0.12, 0.22), SHELL, Enum.Material.Metal),
+			CFrame.new(sx * (GUN_X + 0.1), GUN_Y + 0.05, -0.1))
+		accents[#accents + 1] = gimbalPart(mk("GunStripe" .. i, Vector3.new(0.03, 0.02, 0.22), ACCENT),
+			CFrame.new(sx * GUN_X, GUN_Y + 0.09, -0.2))
+		gcyl("GunShroud", 0.18, 0.085, -0.42, GRAPHITE_LIGHT, Enum.Material.Metal)
+		gcyl("GunBarrel", 0.42, 0.045, -0.55, Color3.fromRGB(170, 175, 185), Enum.Material.Metal)
+		gcyl("GunBrake", 0.06, 0.09, -0.7, GRAPHITE, Enum.Material.Metal)
+
+		local flash = gimbalPart(mk("MuzzleFlash" .. i, Vector3.new(0.2, 0.2, 0.2), Color3.fromRGB(255, 190, 90), Enum.Material.Neon, Enum.PartType.Ball),
+			CFrame.new(sx * GUN_X, GUN_Y, -0.78))
+		flash.Transparency = 1
+		local fl = Instance.new("PointLight")
+		fl.Color = Color3.fromRGB(255, 190, 90)
+		fl.Range = 10
+		fl.Brightness = 4
+		fl.Enabled = false
+		fl.Parent = flash
+		local puff = newEmitter(flash, { l0 = 0.05, l1 = 0.11, s0 = 8, s1 = 16, size = 0.4, spread = 18 })
+		muzzles[i] = { rel = CFrame.new(sx * GUN_X, GUN_Y, -0.78), part = flash, light = fl, puff = puff, t = 0 }
+	end
+
+	hullPart = statics[1][1]
+end
+
+-- Soft, filtered, positional gun sound
+local playShot
+do
+	local soundPool, soundIdx = {}, 0
+	for i = 1, 6 do
+		local s = Instance.new("Sound")
+		s.Name = "GunShot" .. i
+		s.SoundId = CONFIG.SoundIds[(i - 1) % #CONFIG.SoundIds + 1]
+		s.Volume = 0
+		s.RollOffMode = Enum.RollOffMode.Linear
+		s.RollOffMinDistance = 10
+		s.RollOffMaxDistance = 90
+		local eq = Instance.new("EqualizerSoundEffect")
+		eq.LowGain = 2
+		eq.MidGain = -3
+		eq.HighGain = -12
+		eq.Parent = s
+		s.Parent = hullPart
+		soundPool[i] = s
+	end
+	playShot = function()
+		local vol = CONFIG.SoundLevels[soundLevel] or 0
+		if vol <= 0 then
+			return
+		end
+		soundIdx = soundIdx % #soundPool + 1
+		local s = soundPool[soundIdx]
+		s.Volume = vol * (0.85 + math.random() * 0.15)
+		s.PlaybackSpeed = CONFIG.SoundSpeedMin + math.random() * (CONFIG.SoundSpeedMax - CONFIG.SoundSpeedMin)
+		s.TimePosition = 0
+		s:Play()
+	end
+end
+
+local allParts, allCFs = {}, {}
+for _, s in ipairs(statics) do
+	allParts[#allParts + 1] = s[1]
+end
+for _, r in ipairs(rotors) do
+	for _, bp in ipairs(r.parts) do
+		allParts[#allParts + 1] = bp[1]
+	end
+end
+for _, g in ipairs(gimbalParts) do
+	allParts[#allParts + 1] = g[1]
+end
+
+local function applyLights()
+	local nav2 = lightMode >= 1
+	local full = lightMode == 2
+	headlight.Enabled = full
+	headBulb.Material = full and Enum.Material.Neon or Enum.Material.SmoothPlastic
+	lensGlass.Material = full and Enum.Material.Neon or Enum.Material.SmoothPlastic
+	for _, a in ipairs(accents) do
+		a.Material = full and Enum.Material.Neon or Enum.Material.SmoothPlastic
+	end
+	for _, led in ipairs(navLeds) do
+		if led.kind == "steady" then
+			led.part.Material = nav2 and Enum.Material.Neon or Enum.Material.SmoothPlastic
+		end
+	end
+end
+
+do
+	if hrp then
+		local look = hrp.CFrame.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+		pos = hrp.Position + flat * 6 + Vector3.new(0, 4, 0)
+	else
+		pos = camera.CFrame.Position + camera.CFrame.LookVector * 6
+	end
+	if handoff and handoff.pos then
+		pos = handoff.pos
+	end
+	local rx, ry = camera.CFrame:ToOrientation()
+	yaw, pitch = ry, math.clamp(rx, -CONFIG.MaxPitch, CONFIG.MaxPitch)
+	model.Parent = Workspace
+end
+
+----------------------------------------------------------------------
+-- Player lock / release (camera + controls)
+----------------------------------------------------------------------
+local ctl = {}
+do
+	local ok, c = pcall(function()
+		local scripts = player:WaitForChild("PlayerScripts", 5)
+		local module = scripts:WaitForChild("PlayerModule", 5)
+		return require(module):GetControls()
+	end)
+	ctl.ok, ctl.controls = ok, c
+end
+
+local function lockPlayer()
+	released = false
+	if ctl.ok and ctl.controls then
+		pcall(function()
+			ctl.controls:Disable()
+		end)
+	else
+		local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if h then
+			ctl.hum = h
+			ctl.walk, ctl.jp, ctl.jh = h.WalkSpeed, h.JumpPower, h.JumpHeight
+			h.WalkSpeed = 0
+			h.JumpPower = 0
+			h.JumpHeight = 0
+		end
+	end
+end
+
+local function releasePlayer()
+	if released then
+		return
+	end
+	released = true
+	camera = Workspace.CurrentCamera
+	camera.CameraType = Enum.CameraType.Custom
+	camera.FieldOfView = savedFov
+	local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if h then
+		camera.CameraSubject = h
+	end
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	if ctl.ok and ctl.controls then
+		pcall(function()
+			ctl.controls:Enable()
+		end)
+	elseif ctl.hum and ctl.walk and ctl.hum.Parent then
+		ctl.hum.WalkSpeed = ctl.walk
+		ctl.hum.JumpPower = ctl.jp
+		ctl.hum.JumpHeight = ctl.jh
+	end
+end
+
+----------------------------------------------------------------------
+-- UI helpers
+----------------------------------------------------------------------
+local PRESS_IN = TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local PRESS_OUT = TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local SLIDE_IN = TweenInfo.new(0.6, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local SLIDE_OUT = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+
+local function tween(obj, info, props)
+	local t = TweenService:Create(obj, info, props)
+	t:Play()
+	return t
+end
+
+local function newScreenGui(name)
+	local g = Instance.new("ScreenGui")
+	g.Name = name
+	g.ResetOnSpawn = false
+	g.IgnoreGuiInset = true
+	g.DisplayOrder = 100
+	g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	if not pcall(function()
+		g.Parent = player:WaitForChild("PlayerGui", 5)
+	end) then
+		g.Parent = game:GetService("CoreGui")
+	end
+	return g
+end
+
+local btnState = setmetatable({}, { __mode = "k" })
+
+local function corner(parent, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = r
+	c.Parent = parent
+	return c
+end
+
+local function strokeOn(parent, color, transparency, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Transparency = transparency
+	s.Thickness = thickness
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	return s
+end
+
+local function label(parent, text, size, color, pos2, size2, font)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextSize = size
+	l.TextColor3 = color
+	l.Font = font or Enum.Font.GothamBold
+	l.Position = pos2 or UDim2.new()
+	l.Size = size2 or UDim2.fromScale(1, 1)
+	l.Parent = parent
+	return l
+end
+
+local function skin(b, accent, radius)
+	b.AutoButtonColor = false
+	b.Text = ""
+	b.BackgroundColor3 = BASE
+	b.BackgroundTransparency = 0.2
+	b.BorderSizePixel = 0
+	corner(b, UDim.new(0, radius or 14))
+
+	local grad = Instance.new("UIGradient")
+	grad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(175, 182, 195))
+	grad.Rotation = 90
+	grad.Parent = b
+
+	local stroke = strokeOn(b, accent, 0.7, 1.5)
+	local scale = Instance.new("UIScale")
+	scale.Parent = b
+
+	btnState[b] = {
+		scale = scale,
+		stroke = stroke,
+		tweens = {},
+		active = false,
+		pressed = false,
+		pressBg = BASE:Lerp(accent, 0.38),
+		activeBg = BASE:Lerp(accent, 0.18),
+	}
+end
+
+local function press(b, down)
+	local s = btnState[b]
+	if not s then
+		return
+	end
+	s.pressed = down
+	for _, t in ipairs(s.tweens) do
+		t:Cancel()
+	end
+	local info = down and PRESS_IN or PRESS_OUT
+	s.tweens = {
+		tween(s.scale, info, { Scale = down and 0.9 or 1 }),
+		tween(b, info, {
+			BackgroundColor3 = down and s.pressBg or (s.active and s.activeBg or BASE),
+			BackgroundTransparency = down and 0.02 or 0.2,
+		}),
+		tween(s.stroke, info, {
+			Transparency = down and 0.02 or (s.active and 0.3 or 0.7),
+			Thickness = down and 2.6 or 1.5,
+		}),
+	}
+end
+
+local function setActive(b, on)
+	local s = btnState[b]
+	if not s or s.active == on then
+		return
+	end
+	s.active = on
+	if not s.pressed then
+		press(b, false)
+	end
+end
+
+local function setSub(b, text)
+	local s = btnState[b]
+	if s and s.sub and s.sub.Text ~= text then
+		s.sub.Text = text
+	end
+end
+
+local function hook(b, onDown, onUp)
+	b.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			press(b, true)
+			if onDown then
+				onDown()
+			end
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+					c:Disconnect()
+					press(b, false)
+					if onUp then
+						onUp()
+					end
+				end
+			end)
+		end
+	end)
+end
+
+local function newButton(parent, size, pos2, accent, radius)
+	local b = Instance.new("TextButton")
+	b.Size = size
+	b.Position = pos2 or UDim2.new()
+	skin(b, accent or ACCENT, radius)
+	b.Parent = parent
+	return b
+end
+
+local function chevron(b, rotation, size, offset)
+	local holder = Instance.new("Frame")
+	holder.AnchorPoint = Vector2.new(0.5, 0.5)
+	holder.Position = UDim2.new(0.5, 0, 0.5, offset or 0)
+	holder.Size = UDim2.fromOffset(size, size)
+	holder.BackgroundTransparency = 1
+	holder.Rotation = rotation
+	holder.Parent = b
+	local len = size * 0.58
+	local thick = math.max(3, size * 0.17)
+	local off = len * 0.3536
+	for _, side in ipairs({ -1, 1 }) do
+		local bar = Instance.new("Frame")
+		bar.AnchorPoint = Vector2.new(0.5, 0.5)
+		bar.Size = UDim2.fromOffset(len, thick)
+		bar.Position = UDim2.new(0.5, side * off, 0.5, 0)
+		bar.Rotation = side * 45
+		bar.BackgroundColor3 = WHITE
+		bar.BorderSizePixel = 0
+		bar.Parent = holder
+		corner(bar, UDim.new(1, 0))
+	end
+	return holder
+end
+
+local function makeGroup(parentGui, list, anchor, finalPos, size, startPos)
+	local f = Instance.new("Frame")
+	f.AnchorPoint = anchor
+	f.Position = startPos
+	f.Size = size
+	f.BackgroundTransparency = 1
+	f.Parent = parentGui
+	local sc = Instance.new("UIScale")
+	sc.Parent = f
+	local rec = { frame = f, scale = sc, final = finalPos, start = startPos }
+	list[#list + 1] = rec
+	return f, rec
+end
+
+local function computeScale()
+	local vp = Workspace.CurrentCamera.ViewportSize
+	return math.clamp(math.min(vp.X, vp.Y * 1.6) / 780, 0.62, 1.1)
+end
+local function applyScale(list)
+	local s = computeScale()
+	for _, g in ipairs(list) do
+		g.scale.Scale = s
+	end
+end
+
+-- Pilot UI state
+local gui, groups = nil, {}
+local reticle, recDot, recLabel, altLabel, spdLabel, hdgLabel
+local lightsBtn, camBtn, boostBtn, zoomBtn, fireBtn, soundBtn
+local lastZoomText = ""
+
+-- Follow-mode UI state
+local followGui, fgroups = nil, {}
+local enterBtn, recallBtn, recallRec
+local recallShown = false
+
+-- Forward declarations
+local exitDrone, enterPilot, startRecall, finishExit, cleanup
+
+local function updateLightsUI()
+	if not (lightsBtn and lightsBtn.Parent) then
+		return
+	end
+	setSub(lightsBtn, lightMode == 2 and "ALL" or lightMode == 1 and "NAV" or "OFF")
+	setActive(lightsBtn, lightMode > 0)
+end
+local function updateCamUI()
+	setSub(camBtn, firstPerson and "FPV" or "CHASE")
+	setActive(camBtn, not firstPerson)
+end
+local function updateBoostUI()
+	setSub(boostBtn, boostOn and "ON" or "OFF")
+	setActive(boostBtn, boostOn)
+end
+local function updateSoundUI()
+	if not (soundBtn and soundBtn.Parent) then
+		return
+	end
+	setSub(soundBtn, CONFIG.SoundLevelNames[soundLevel] or "OFF")
+	setActive(soundBtn, (CONFIG.SoundLevels[soundLevel] or 0) > 0)
+end
+local function updateZoomUI()
+	local mult = CONFIG.DefaultFOV / fov
+	local txt = string.format("%.1fx", mult)
+	if txt ~= lastZoomText then
+		lastZoomText = txt
+		setSub(zoomBtn, txt)
+		setActive(zoomBtn, mult > 1.05)
+	end
+end
+
+local function updateSensUI()
+	if not (sensKnob and sensKnob.Parent) then
+		return
+	end
+	local t = math.clamp(math.log(sens / CONFIG.SensMin) / math.log(CONFIG.SensMax / CONFIG.SensMin), 0, 1)
+	sensKnob.Position = UDim2.new(t, 0, 0.5, 0)
+	sensFill.Size = UDim2.fromScale(t, 1)
+	sensValue.Text = string.format("%.2fx", sens)
+end
+local function setSens(v)
+	sens = math.clamp(math.floor(v * 20 + 0.5) / 20, CONFIG.SensMin, CONFIG.SensMax)
+	updateSensUI()
+end
+
+local function cycleLights()
+	lightMode = (lightMode - 1) % 3
+	applyLights()
+	updateLightsUI()
+end
+local function toggleCam()
+	firstPerson = not firstPerson
+	updateCamUI()
+end
+local function toggleBoost()
+	boostOn = not boostOn
+	updateBoostUI()
+end
+local function cycleSound()
+	soundLevel = soundLevel % #CONFIG.SoundLevels + 1
+	updateSoundUI()
+end
+local function cycleZoom()
+	zoomIndex = zoomIndex % #CONFIG.ZoomLevels + 1
+	fov = CONFIG.DefaultFOV / CONFIG.ZoomLevels[zoomIndex]
+end
+
+----------------------------------------------------------------------
+-- Machine gun system (visual only)
+----------------------------------------------------------------------
+local gun = { shake = 0, timer = 0 }
+local updateBullets, updateFlashes, fireShot
+do
+	local bullets = {}
+	local gunIndex = 1
+
+	local function spawnImpact(at, normal)
+		normal = normal or Vector3.yAxis
+		local p = mk("Impact", Vector3.new(0.2, 0.2, 0.2), BULLET_HOT, Enum.Material.Neon)
+		p.Transparency = 1
+		p.CFrame = CFrame.lookAt(at + normal * 0.1, at + normal * 1.1)
+
+		local sparks = newEmitter(p, {
+			l0 = 0.15, l1 = 0.38, s0 = 10, s1 = 28, size = 0.32, spread = 55,
+			acc = Vector3.new(0, -45, 0),
+		})
+		local glow = newEmitter(p, { l0 = 0.09, size = 2.2 })
+		local dust = newEmitter(p, {
+			l0 = 0.3, l1 = 0.5, s0 = 2, s1 = 6, size = 1.2, spread = 70,
+			c0 = Color3.fromRGB(190, 190, 195), c1 = Color3.fromRGB(120, 120, 125),
+		})
+		dust.LightEmission = 0.1
+		dust.Transparency = NumberSequence.new(0.5, 1)
+		sparks:Emit(9)
+		glow:Emit(1)
+		dust:Emit(2)
+
+		local l = Instance.new("PointLight")
+		l.Color = Color3.fromRGB(255, 190, 90)
+		l.Range = 8
+		l.Brightness = 3
+		l.Parent = p
+		tween(l, TweenInfo.new(0.15), { Brightness = 0 })
+
+		task.delay(0.8, function()
+			p:Destroy()
+		end)
+	end
+
+	local function spawnBullet(from, to, normal)
+		local vec = to - from
+		local total = vec.Magnitude
+		if total < 1 then
+			return
+		end
+		if #bullets >= CONFIG.MaxTracers then
+			local old = table.remove(bullets, 1)
+			old.retire()
+		end
+
+		local core = mk("Bullet", Vector3.new(0.22, 0.22, 0.22), BULLET_HOT, Enum.Material.Neon, Enum.PartType.Ball)
+		core.CFrame = CFrame.new(from)
+
+		local a0 = Instance.new("Attachment")
+		a0.Position = Vector3.new(0, 0.11, 0)
+		a0.Parent = core
+		local a1 = Instance.new("Attachment")
+		a1.Position = Vector3.new(0, -0.11, 0)
+		a1.Parent = core
+		local trail = Instance.new("Trail")
+		trail.Attachment0 = a0
+		trail.Attachment1 = a1
+		trail.Lifetime = 0.09
+		trail.LightEmission = 1
+		trail.LightInfluence = 0
+		trail.FaceCamera = true
+		trail.Color = ColorSequence.new(BULLET_HOT, BULLET_WARM)
+		trail.Transparency = NumberSequence.new(0.05, 1)
+		trail.WidthScale = NumberSequence.new(1, 0)
+		trail.Parent = core
+
+		local dots = newEmitter(core, { rate = 140, l0 = 0.1, l1 = 0.2, size = 0.5 })
+
+		local b = {
+			part = core,
+			from = from,
+			dir = vec.Unit,
+			total = total,
+			dist = 0,
+			impact = normal and to or nil,
+			normal = normal,
+		}
+		function b.retire()
+			dots.Enabled = false
+			trail.Enabled = false
+			core.Transparency = 1
+			task.delay(0.4, function()
+				core:Destroy()
+			end)
+		end
+		bullets[#bullets + 1] = b
+	end
+
+	updateBullets = function(dt)
+		for i = #bullets, 1, -1 do
+			local b = bullets[i]
+			b.dist += CONFIG.BulletSpeed * dt
+			if b.dist >= b.total then
+				if b.impact then
+					spawnImpact(b.impact, b.normal)
+				end
+				b.retire()
+				table.remove(bullets, i)
+			else
+				b.part.CFrame = CFrame.new(b.from + b.dir * b.dist)
+			end
+		end
+	end
+
+	updateFlashes = function(dt)
+		for _, m in ipairs(muzzles) do
+			if m.t > 0 then
+				m.t -= dt
+			end
+			local on = m.t > 0
+			m.part.Transparency = on and 0.1 or 1
+			m.light.Enabled = on
+		end
+	end
+
+	fireShot = function(gimbalCF)
+		local cam = camera.CFrame
+		local s = CONFIG.Spread
+		local aim = cam * CFrame.Angles((math.random() - 0.5) * s, (math.random() - 0.5) * s, 0)
+		aimParams.FilterDescendantsInstances = { model, player.Character }
+		local range = CONFIG.FireRange
+		local hit = Workspace:Raycast(aim.Position, aim.LookVector * range, aimParams)
+		local target = hit and hit.Position or (aim.Position + aim.LookVector * range)
+		local normal = hit and hit.Normal or nil
+
+		local m = muzzles[gunIndex]
+		gunIndex = gunIndex % #muzzles + 1
+		local from = (gimbalCF * m.rel).Position
+
+		if (target - from):Dot(gimbalCF.LookVector) <= 1 then
+			target = from + gimbalCF.LookVector * range
+			normal = nil
+		end
+
+		spawnBullet(from, target, normal)
+		m.t = 0.045
+		m.puff:Emit(3)
+		playShot()
+		gun.shake = math.min(gun.shake + 0.35, 1)
+	end
+end
+
+----------------------------------------------------------------------
+-- Pilot UI
+----------------------------------------------------------------------
+local function buildPilotUI()
+	local myGui = newScreenGui("DroneUI")
+	gui = myGui
+	groups = {}
+	lastZoomText = ""
+
+	local function shade(anchorY, rotation)
+		local f = Instance.new("Frame")
+		f.AnchorPoint = Vector2.new(0, anchorY)
+		f.Position = UDim2.fromScale(0, anchorY)
+		f.Size = UDim2.new(1, 0, 0, 110)
+		f.BackgroundColor3 = Color3.new(0, 0, 0)
+		f.BorderSizePixel = 0
+		local g = Instance.new("UIGradient")
+		g.Transparency = NumberSequence.new(0.5, 1)
+		g.Rotation = rotation
+		g.Parent = f
+		f.Parent = myGui
+	end
+	shade(0, 90)
+	shade(1, -90)
+
+	reticle = Instance.new("Frame")
+	reticle.AnchorPoint = Vector2.new(0.5, 0.5)
+	reticle.Position = UDim2.fromScale(0.5, 0.5)
+	reticle.Size = UDim2.fromOffset(34, 34)
+	reticle.BackgroundTransparency = 1
+	reticle.Parent = myGui
+	corner(reticle, UDim.new(1, 0))
+	strokeOn(reticle, WHITE, 0.65, 1.5)
+	local retDot = Instance.new("Frame")
+	retDot.AnchorPoint = Vector2.new(0.5, 0.5)
+	retDot.Position = UDim2.fromScale(0.5, 0.5)
+	retDot.Size = UDim2.fromOffset(4, 4)
+	retDot.BackgroundColor3 = ACCENT
+	retDot.BorderSizePixel = 0
+	retDot.Parent = reticle
+	corner(retDot, UDim.new(1, 0))
+
+	local dpad = makeGroup(myGui, groups, Vector2.new(0, 1), UDim2.new(0, 20, 1, -20), UDim2.fromOffset(204, 204), UDim2.new(0, -260, 1, -20))
+	local plate = Instance.new("Frame")
+	plate.Size = UDim2.fromScale(1, 1)
+	plate.BackgroundColor3 = BASE
+	plate.BackgroundTransparency = 0.45
+	plate.Parent = dpad
+	corner(plate, UDim.new(1, 0))
+	strokeOn(plate, ACCENT, 0.85, 1.5)
+	local hubDot = Instance.new("Frame")
+	hubDot.AnchorPoint = Vector2.new(0.5, 0.5)
+	hubDot.Position = UDim2.fromScale(0.5, 0.5)
+	hubDot.Size = UDim2.fromOffset(14, 14)
+	hubDot.BackgroundColor3 = ACCENT
+	hubDot.BackgroundTransparency = 0.6
+	hubDot.BorderSizePixel = 0
+	hubDot.Parent = dpad
+	corner(hubDot, UDim.new(1, 0))
+
+	local function dpadButton(key, x, y, rot)
+		local b = newButton(dpad, UDim2.fromOffset(64, 64), UDim2.fromOffset(x, y), ACCENT, 16)
+		chevron(b, rot, 30)
+		hook(b, function()
+			held[key] = true
+		end, function()
+			held[key] = false
+		end)
+		return b
+	end
+	dpadButton("fwd", 70, 0, 0)
+	dpadButton("left", 0, 70, -90)
+	dpadButton("right", 140, 70, 90)
+	dpadButton("back", 70, 140, 180)
+
+	local vert = makeGroup(myGui, groups, Vector2.new(1, 1), UDim2.new(1, -20, 1, -20), UDim2.fromOffset(78, 164), UDim2.new(1, 260, 1, -20))
+	local function vertButton(key, y, rot, text)
+		local b = newButton(vert, UDim2.fromOffset(78, 78), UDim2.fromOffset(0, y), ACCENT, 18)
+		chevron(b, rot, 24, rot == 0 and -10 or 10)
+		chevron(b, rot, 24, rot == 0 and 2 or -2)
+		label(b, text, 11, ACCENT, UDim2.new(0, 0, 1, -18), UDim2.new(1, 0, 0, 14))
+		hook(b, function()
+			held[key] = true
+		end, function()
+			held[key] = false
+		end)
+		return b
+	end
+	vertButton("up", 0, 0, "UP")
+	vertButton("down", 86, 180, "DOWN")
+
+	local fireGroup = makeGroup(myGui, groups, Vector2.new(1, 1), UDim2.new(1, -108, 1, -20), UDim2.fromOffset(78, 78), UDim2.new(1, 360, 1, -20))
+	fireBtn = newButton(fireGroup, UDim2.fromScale(1, 1), nil, DANGER, 18)
+	local fireRing = Instance.new("Frame")
+	fireRing.AnchorPoint = Vector2.new(0.5, 0.5)
+	fireRing.Position = UDim2.new(0.5, 0, 0.5, -9)
+	fireRing.Size = UDim2.fromOffset(28, 28)
+	fireRing.BackgroundTransparency = 1
+	fireRing.Parent = fireBtn
+	corner(fireRing, UDim.new(1, 0))
+	strokeOn(fireRing, WHITE, 0, 3)
+	local fireDot = Instance.new("Frame")
+	fireDot.AnchorPoint = Vector2.new(0.5, 0.5)
+	fireDot.Position = UDim2.fromScale(0.5, 0.5)
+	fireDot.Size = UDim2.fromOffset(8, 8)
+	fireDot.BackgroundColor3 = DANGER
+	fireDot.BorderSizePixel = 0
+	fireDot.Parent = fireRing
+	corner(fireDot, UDim.new(1, 0))
+	label(fireBtn, "FIRE", 11, DANGER, UDim2.new(0, 0, 1, -18), UDim2.new(1, 0, 0, 14))
+	hook(fireBtn, function()
+		held.fire = true
+	end, function()
+		held.fire = false
+	end)
+
+	local side = makeGroup(myGui, groups, Vector2.new(1, 0), UDim2.new(1, -20, 0, 66), UDim2.fromOffset(120, 264), UDim2.new(1, 260, 0, 66))
+	local list = Instance.new("UIListLayout")
+	list.Padding = UDim.new(0, 6)
+	list.SortOrder = Enum.SortOrder.LayoutOrder
+	list.Parent = side
+
+	local panelOrder = 0
+	local function panelButton(title)
+		panelOrder += 1
+		local b = newButton(side, UDim2.fromOffset(120, 48), nil, ACCENT, 12)
+		b.LayoutOrder = panelOrder
+		label(b, title, 14, WHITE, UDim2.new(0, 0, 0, 6), UDim2.new(1, 0, 0, 18))
+		btnState[b].sub = label(b, "", 12, ACCENT, UDim2.new(0, 0, 0, 25), UDim2.new(1, 0, 0, 16), Enum.Font.GothamMedium)
+		hook(b)
+		return b
+	end
+
+	lightsBtn = panelButton("LIGHTS")
+	camBtn = panelButton("CAMERA")
+	boostBtn = panelButton("BOOST")
+	zoomBtn = panelButton("ZOOM")
+	soundBtn = panelButton("SOUND")
+
+	lightsBtn.Activated:Connect(cycleLights)
+	camBtn.Activated:Connect(toggleCam)
+	boostBtn.Activated:Connect(toggleBoost)
+	zoomBtn.Activated:Connect(cycleZoom)
+	soundBtn.Activated:Connect(cycleSound)
+
+	applyLights()
+	updateLightsUI()
+	updateCamUI()
+	updateBoostUI()
+	updateZoomUI()
+	updateSoundUI()
+
+	sensDrag = nil
+	local sensGroup = makeGroup(myGui, groups, Vector2.new(0, 0), UDim2.new(0, 20, 0, 12), UDim2.fromOffset(190, 62), UDim2.new(0, -260, 0, 12))
+	local sensPanel = newButton(sensGroup, UDim2.fromScale(1, 1), nil, ACCENT, 14)
+	local sensTitle = label(sensPanel, "SENSITIVITY", 12, WHITE, UDim2.new(0, 14, 0, 7), UDim2.new(0.6, 0, 0, 16))
+	sensTitle.TextXAlignment = Enum.TextXAlignment.Left
+	sensValue = label(sensPanel, "", 13, ACCENT, UDim2.new(0.5, 0, 0, 7), UDim2.new(0.5, -14, 0, 16), Enum.Font.GothamMedium)
+	sensValue.TextXAlignment = Enum.TextXAlignment.Right
+
+	local track = Instance.new("Frame")
+	track.AnchorPoint = Vector2.new(0, 0.5)
+	track.Position = UDim2.new(0, 18, 0, 42)
+	track.Size = UDim2.new(1, -36, 0, 5)
+	track.BackgroundColor3 = WHITE
+	track.BackgroundTransparency = 0.75
+	track.BorderSizePixel = 0
+	track.Parent = sensPanel
+	corner(track, UDim.new(1, 0))
+	sensFill = Instance.new("Frame")
+	sensFill.BackgroundColor3 = ACCENT
+	sensFill.BorderSizePixel = 0
+	sensFill.Parent = track
+	corner(sensFill, UDim.new(1, 0))
+	sensKnob = Instance.new("Frame")
+	sensKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+	sensKnob.Size = UDim2.fromOffset(26, 26)
+	sensKnob.BackgroundColor3 = WHITE
+	sensKnob.BorderSizePixel = 0
+	sensKnob.Parent = track
+	corner(sensKnob, UDim.new(1, 0))
+	strokeOn(sensKnob, ACCENT, 0, 2.5)
+
+	local function setFromX(x)
+		local w = track.AbsoluteSize.X
+		if w > 0 then
+			local t = math.clamp((x - track.AbsolutePosition.X) / w, 0, 1)
+			setSens(CONFIG.SensMin * (CONFIG.SensMax / CONFIG.SensMin) ^ t)
+		end
+	end
+	sensPanel.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			sensDrag = input
+			setFromX(input.Position.X)
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+					c:Disconnect()
+					if sensDrag == input then
+						sensDrag = nil
+					end
+				end
+			end)
+		end
+	end)
+	pilotConns[#pilotConns + 1] = UserInputService.InputChanged:Connect(function(input)
+		if sensDrag and input == sensDrag then
+			setFromX(input.Position.X)
+		end
+	end)
+	updateSensUI()
+
+	local exitGroup = makeGroup(myGui, groups, Vector2.new(1, 0), UDim2.new(1, -20, 0, 12), UDim2.fromOffset(46, 46), UDim2.new(1, 120, 0, 12))
+	local exitBtn = newButton(exitGroup, UDim2.fromScale(1, 1), nil, DANGER, 23)
+	for _, rot in ipairs({ 45, -45 }) do
+		local bar = Instance.new("Frame")
+		bar.AnchorPoint = Vector2.new(0.5, 0.5)
+		bar.Position = UDim2.fromScale(0.5, 0.5)
+		bar.Size = UDim2.fromOffset(22, 4)
+		bar.Rotation = rot
+		bar.BackgroundColor3 = WHITE
+		bar.BorderSizePixel = 0
+		bar.Parent = exitBtn
+		corner(bar, UDim.new(1, 0))
+	end
+	hook(exitBtn)
+	exitBtn.Activated:Connect(function()
+		exitDrone()
+	end)
+
+	local hudGroup = makeGroup(myGui, groups, Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 12), UDim2.fromOffset(0, 34), UDim2.new(0.5, 0, 0, -80))
+	hudGroup.AutomaticSize = Enum.AutomaticSize.X
+	hudGroup.BackgroundTransparency = 0.3
+	hudGroup.BackgroundColor3 = BASE
+	corner(hudGroup, UDim.new(1, 0))
+	strokeOn(hudGroup, ACCENT, 0.8, 1.5)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 16)
+	pad.PaddingRight = UDim.new(0, 16)
+	pad.Parent = hudGroup
+	local hl = Instance.new("UIListLayout")
+	hl.FillDirection = Enum.FillDirection.Horizontal
+	hl.VerticalAlignment = Enum.VerticalAlignment.Center
+	hl.Padding = UDim.new(0, 12)
+	hl.Parent = hudGroup
+
+	recDot = Instance.new("Frame")
+	recDot.Size = UDim2.fromOffset(10, 10)
+	recDot.BackgroundColor3 = DANGER
+	recDot.BorderSizePixel = 0
+	recDot.LayoutOrder = 1
+	recDot.Parent = hudGroup
+	corner(recDot, UDim.new(1, 0))
+
+	local function hudLabel(order, width)
+		local l = label(hudGroup, "", 14, WHITE, nil, UDim2.fromOffset(width, 34), Enum.Font.GothamMedium)
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.LayoutOrder = order
+		return l
+	end
+	recLabel = hudLabel(2, 44)
+	altLabel = hudLabel(3, 62)
+	spdLabel = hudLabel(4, 76)
+	hdgLabel = hudLabel(5, 70)
+
+	local hint = label(myGui, UserInputService.TouchEnabled
+		and "Drag anywhere to look   -   FIRE to shoot   -   X exits and leaves the drone with you"
+		or "Right-click to look   -   WASD / Space / Q to fly   -   Click or F to fire   -   X exits",
+		15, WHITE, UDim2.new(0.5, 0, 1, -22), UDim2.fromOffset(680, 22), Enum.Font.GothamMedium)
+	hint.AnchorPoint = Vector2.new(0.5, 1)
+	hint.TextStrokeTransparency = 0.5
+	hint.TextTransparency = 1
+	tween(hint, TweenInfo.new(0.6), { TextTransparency = 0 })
+	task.delay(7, function()
+		if hint.Parent then
+			tween(hint, TweenInfo.new(1), { TextTransparency = 1, TextStrokeTransparency = 1 })
+		end
+	end)
+
+	applyScale(groups)
+	for i, g in ipairs(groups) do
+		task.delay(0.06 * i, function()
+			if not destroyed and mode == "pilot" and not exiting and gui == myGui then
+				tween(g.frame, SLIDE_IN, { Position = g.final })
+			end
+		end)
+	end
+end
+
+----------------------------------------------------------------------
+-- Follow-mode UI
+----------------------------------------------------------------------
+local function setRecallVisible(v)
+	if not recallRec or v == recallShown then
+		return
+	end
+	recallShown = v
+	tween(recallRec.frame, v and SLIDE_IN or SLIDE_OUT, { Position = v and recallRec.final or recallRec.start })
+end
+
+local function destroyFollowUI()
+	if followGui then
+		followGui:Destroy()
+	end
+	followGui, fgroups, enterBtn, recallBtn, recallRec = nil, {}, nil, nil, nil
+	recallShown = false
+end
+
+local function buildFollowUI()
+	destroyFollowUI()
+	local myGui = newScreenGui("DroneFollowUI")
+	followGui = myGui
+
+	local function topButton(title, sub, finalPos, startPos)
+		local frame, rec = makeGroup(myGui, fgroups, Vector2.new(1, 0), finalPos, UDim2.fromOffset(120, 48), startPos)
+		local b = newButton(frame, UDim2.fromScale(1, 1), nil, ACCENT, 12)
+		label(b, title, 14, WHITE, UDim2.new(0, 0, 0, 6), UDim2.new(1, 0, 0, 18))
+		btnState[b].sub = label(b, sub, 12, ACCENT, UDim2.new(0, 0, 0, 25), UDim2.new(1, 0, 0, 16), Enum.Font.GothamMedium)
+		hook(b)
+		return b, rec
+	end
+
+	local enterRec
+	enterBtn, enterRec = topButton("ENTER", "DRONE", UDim2.new(1, -20, 0, 12), UDim2.new(1, 260, 0, 12))
+	recallBtn, recallRec = topButton("RECALL", "", UDim2.new(1, -20, 0, 66), UDim2.new(1, 260, 0, 66))
+	enterBtn.Activated:Connect(function()
+		enterPilot()
+	end)
+	recallBtn.Activated:Connect(function()
+		startRecall()
+	end)
+
+	applyScale(fgroups)
+	task.delay(0.06, function()
+		if not destroyed and followGui == myGui then
+			tween(enterRec.frame, SLIDE_IN, { Position = enterRec.final })
+		end
+	end)
+	setRecallVisible(fstate ~= "follow")
+end
+
+-- World marker so a parked drone is easy to spot
+local marker, markerLabel
+do
+	marker = Instance.new("BillboardGui")
+	marker.Name = "DroneMarker"
+	marker.Adornee = hullPart
+	marker.AlwaysOnTop = true
+	marker.Size = UDim2.fromOffset(120, 34)
+	marker.StudsOffset = Vector3.new(0, 3.5, 0)
+	marker.MaxDistance = math.huge
+	marker.LightInfluence = 0
+	marker.ResetOnSpawn = false
+	marker.Enabled = false
+	local markerFrame = Instance.new("Frame")
+	markerFrame.Size = UDim2.fromScale(1, 1)
+	markerFrame.BackgroundColor3 = BASE
+	markerFrame.BackgroundTransparency = 0.25
+	markerFrame.BorderSizePixel = 0
+	markerFrame.Parent = marker
+	corner(markerFrame, UDim.new(1, 0))
+	strokeOn(markerFrame, ACCENT, 0.35, 1.5)
+	markerLabel = label(markerFrame, "DRONE", 13, WHITE)
+	if not pcall(function()
+		marker.Parent = player:WaitForChild("PlayerGui", 5)
+	end) then
+		marker.Parent = game:GetService("CoreGui")
+	end
+end
+
+----------------------------------------------------------------------
+-- Hitbox + collision movement
+-- Fuselage box + one box around each arm/rotor, swept along the motion.
+----------------------------------------------------------------------
+local hasBlockcast = pcall(function()
+	return Workspace.Blockcast
+end)
+
+local shapes = {}
+do
+	local inflate = Vector3.new(1, 1, 1) * CONFIG.HitInflate
+	shapes[1] = { off = CONFIG.HitBodyOffset, size = CONFIG.HitBodySize + inflate }
+	for _, sx in ipairs({ -1, 1 }) do
+		for _, sz in ipairs({ -1, 1 }) do
+			shapes[#shapes + 1] = {
+				off = Vector3.new(sx * CONFIG.HitRotorXZ, CONFIG.HitRotorOffsetY, sz * CONFIG.HitRotorXZ),
+				size = CONFIG.HitRotorSize + inflate,
+			}
+		end
+	end
+end
+
+local moveWithCollision
+do
+	local function sweepShapes(from, delta)
+		local rot = CFrame.new(from) * CFrame.Angles(0, yaw, 0)
+		local best
+		for _, sh in ipairs(shapes) do
+			local cf = rot * CFrame.new(sh.off)
+			local hit
+			if hasBlockcast then
+				hit = Workspace:Blockcast(cf, sh.size, delta, rayParams)
+			else
+				hit = Workspace:Spherecast(cf.Position, math.min(sh.size.X, sh.size.Z) * 0.5, delta, rayParams)
+			end
+			if hit and (not best or hit.Distance < best.Distance) then
+				best = hit
+			end
+		end
+		return best
+	end
+
+	moveWithCollision = function(from, delta)
+		if not CONFIG.Collision or delta.Magnitude < 1e-5 then
+			return from + delta, nil
+		end
+		rayParams.FilterDescendantsInstances = { model, player.Character }
+		local p, remaining, hitNormal = from, delta, nil
+		for _ = 1, 3 do
+			local mag = remaining.Magnitude
+			if mag < 1e-4 then
+				break
+			end
+			local hit = sweepShapes(p, remaining)
+			if not hit then
+				p = p + remaining
+				remaining = Vector3.zero
+				break
+			end
+			local dirU = remaining.Unit
+			local travel = math.clamp(hit.Distance - 0.01, 0, mag)
+			p = p + dirU * travel
+			local n = hit.Normal
+			hitNormal = n
+			local rest = remaining - dirU * travel
+			remaining = rest - n * rest:Dot(n)
+		end
+		return p, hitNormal
+	end
+end
+
+local function integrate(dt)
+	local newPos, normal = moveWithCollision(pos, vel * dt)
+	pos = newPos
+	if normal then
+		local into = vel:Dot(normal)
+		if into < 0 then
+			vel = vel - normal * into
+		end
+	end
+end
+
+-- Gap between the underside of the fuselage and the ground below
+local function groundGap()
+	rayParams.FilterDescendantsInstances = { model, player.Character }
+	local down = Vector3.new(0, -CONFIG.GroundProbe, 0)
+	if hasBlockcast then
+		local cf = CFrame.new(pos) * CFrame.Angles(0, yaw, 0) * CFrame.new(CONFIG.HitBodyOffset)
+		local hit = Workspace:Blockcast(cf, CONFIG.HitBodySize, down, rayParams)
+		return hit and hit.Distance or math.huge
+	end
+	local hit = Workspace:Raycast(pos, down, rayParams)
+	return hit and math.max(hit.Distance - 0.85, 0) or math.huge
+end
+
+-- Gentle descent; marks the drone as landed once it touches down
+local function settleDown(dt, gap)
+	local vy = -math.clamp(gap * 1.5, 0.5, CONFIG.LandSpeed)
+	vel = vel:Lerp(Vector3.new(0, vy, 0), 1 - math.exp(-dt * 4))
+	integrate(dt)
+	if gap < 0.15 then
+		land.landed, land.landing = true, false
+		vel = Vector3.zero
+	end
+end
+
+----------------------------------------------------------------------
+-- 3D pathfinding: Theta* (any-angle A*) on a coarse 26-connected grid
+----------------------------------------------------------------------
+-- Is the straight line a -> b free for the drone's whole footprint?
+local function clearLine(a, b)
+	local d = b - a
+	if d.Magnitude < 0.05 then
+		return true
+	end
+	if hasBlockcast then
+		local flat = Vector3.new(d.X, 0, d.Z)
+		local cf = flat.Magnitude > 0.01 and CFrame.lookAt(a, a + flat) or CFrame.new(a)
+		return Workspace:Blockcast(cf, CONFIG.PathBox, d, pathParams) == nil
+	end
+	return Workspace:Spherecast(a, CONFIG.PathRadius, d, pathParams) == nil
+end
+
+local findPath
+do
+	local function heapPush(h, item)
+		h.n += 1
+		local i = h.n
+		h[i] = item
+		while i > 1 do
+			local p = i // 2
+			if h[p].f <= h[i].f then
+				break
+			end
+			h[p], h[i] = h[i], h[p]
+			i = p
+		end
+	end
+
+	local function heapPop(h)
+		local top = h[1]
+		local n = h.n
+		h[1] = h[n]
+		h[n] = nil
+		n -= 1
+		h.n = n
+		local i = 1
+		while true do
+			local l, r, s = i * 2, i * 2 + 1, i
+			if l <= n and h[l].f < h[s].f then
+				s = l
+			end
+			if r <= n and h[r].f < h[s].f then
+				s = r
+			end
+			if s == i then
+				break
+			end
+			h[s], h[i] = h[i], h[s]
+			i = s
+		end
+		return top
+	end
+
+	local DIRS = {}
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				if dx ~= 0 or dy ~= 0 or dz ~= 0 then
+					DIRS[#DIRS + 1] = { dx, dy, dz, math.sqrt(dx * dx + dy * dy + dz * dz) }
+				end
+			end
+		end
+	end
+
+	-- returns points, isPartial   (or nil when nothing useful was found)
+	findPath = function(a, b, token)
+		local cell = CONFIG.PathCell
+		local t0 = os.clock()
+		local gx = math.round((b.X - a.X) / cell)
+		local gy = math.round((b.Y - a.Y) / cell)
+		local gz = math.round((b.Z - a.Z) / cell)
+		local margin = math.ceil((CONFIG.PathMargin + nav.marginBonus) / cell)
+		local minX, maxX = math.min(0, gx) - margin, math.max(0, gx) + margin
+		local minY, maxY = math.min(0, gy) - 2, math.max(0, gy) + margin * 2
+		local minZ, maxZ = math.min(0, gz) - margin, math.max(0, gz) + margin
+
+		local function posOf(x, y, z)
+			return a + Vector3.new(x, y, z) * cell
+		end
+		local function keyOf(x, y, z)
+			return ((x + 1024) * 2048 + (y + 1024)) * 2048 + (z + 1024)
+		end
+
+		-- line-of-sight check that yields now and then so the game never hitches
+		local casts, cancelled = 0, false
+		local function los(p, q)
+			casts += 1
+			if casts % 30 == 0 then
+				task.wait()
+				if token ~= nav.token or destroyed then
+					cancelled = true
+				end
+			end
+			return clearLine(p, q)
+		end
+
+		local startDist = (a - b).Magnitude
+		local start = { x = 0, y = 0, z = 0, g = 0, f = startDist * 1.25 }
+		local nodes = { [keyOf(0, 0, 0)] = start }
+		local closed = {}
+		local open = { n = 0 }
+		heapPush(open, start)
+		local best, bestD = start, startDist
+		local expansions = 0
+
+		local function build(node, last)
+			local pts = {}
+			local n = node
+			while n do
+				table.insert(pts, 1, posOf(n.x, n.y, n.z))
+				n = n.parent
+			end
+			pts[1] = a
+			if last then
+				pts[#pts + 1] = last
+			end
+			return pts
+		end
+
+		while open.n > 0 do
+			local cur = heapPop(open)
+			local ck = keyOf(cur.x, cur.y, cur.z)
+			if not closed[ck] then
+				closed[ck] = true
+				local curPos = posOf(cur.x, cur.y, cur.z)
+				local dGoal = (curPos - b).Magnitude
+				if dGoal < bestD then
+					best, bestD = cur, dGoal
+				end
+
+				if dGoal <= cell * 1.8 and los(curPos, b) then
+					return build(cur, b), false
+				end
+				if cancelled then
+					return nil
+				end
+
+				expansions += 1
+				if expansions > CONFIG.PathMaxNodes or os.clock() - t0 > CONFIG.PathMaxSeconds then
+					break
+				end
+
+				local par = cur.parent
+				local parPos = par and posOf(par.x, par.y, par.z)
+				for _, d in ipairs(DIRS) do
+					local nx, ny, nz = cur.x + d[1], cur.y + d[2], cur.z + d[3]
+					if nx >= minX and nx <= maxX and ny >= minY and ny <= maxY and nz >= minZ and nz <= maxZ then
+						local nk = keyOf(nx, ny, nz)
+						if not closed[nk] then
+							local npos = posOf(nx, ny, nz)
+							local ex = nodes[nk]
+							local candParent, candG
+							-- Theta*: try to connect straight to the grandparent first
+							if par then
+								local g1 = par.g + (npos - parPos).Magnitude
+								if (not ex or g1 < ex.g) and los(parPos, npos) then
+									candParent, candG = par, g1
+								end
+							end
+							if not candParent then
+								local g2 = cur.g + cell * d[4]
+								if (not ex or g2 < ex.g) and los(curPos, npos) then
+									candParent, candG = cur, g2
+								end
+							end
+							if candParent then
+								local node = {
+									x = nx, y = ny, z = nz,
+									g = candG,
+									f = candG + (npos - b).Magnitude * 1.25,
+									parent = candParent,
+								}
+								nodes[nk] = node
+								heapPush(open, node)
+							end
+							if cancelled then
+								return nil
+							end
+						end
+					end
+				end
+			end
+		end
+
+		-- No full route: go to the closest reachable point and re-plan from there
+		if best ~= start and bestD < startDist - cell then
+			return build(best), true
+		end
+		return nil
+	end
+end
+
+-- Last resort: climb above everything, cross over, drop in
+local function highRoute(a, b)
+	local base = math.max(a.Y, b.Y)
+	local route
+	for _, h in ipairs({ 25, 50, 100, 200 }) do
+		local top = base + h
+		local p1 = Vector3.new(a.X, top, a.Z)
+		local p2 = Vector3.new(b.X, top, b.Z)
+		route = { a, p1, p2, b }
+		if clearLine(a, p1) and clearLine(p1, p2) and clearLine(p2, b) then
+			return route
+		end
+	end
+	return route
+end
+
+local function dropPath()
+	nav.token += 1
+	nav.busy = false
+	nav.path, nav.goal = nil, nil
+end
+
+local function startPathfind(target)
+	nav.busy = true
+	nav.token += 1
+	local token = nav.token
+	local from = pos
+	nav.goal = target
+	nav.lastPlan = os.clock()
+	task.spawn(function()
+		pathParams.FilterDescendantsInstances = { model, player.Character }
+		local result = findPath(from, target, token)
+		if token ~= nav.token or destroyed then
+			return
+		end
+		if not result then
+			result = highRoute(from, target)
+		end
+		nav.path, nav.idx = result, 2
+		nav.lastPlan = os.clock()
+		nav.busy = false
+	end)
+end
+
+-- Velocity that follows the current path toward `target` (nil = hold position)
+local function pathDesired(dt, target, maxSpeed)
+	local t = os.clock()
+	pathParams.FilterDescendantsInstances = { model, player.Character }
+
+	-- (re)plan when needed; the old path keeps being followed while a new one is searched
+	if not nav.busy and t - nav.lastPlan > 0.5 then
+		local stale = not nav.path
+			or (nav.goal ~= nil and (nav.goal - target).Magnitude > CONFIG.ReplanDistance)
+			or t - nav.lastPlan > CONFIG.ReplanInterval
+			or nav.idx > #nav.path
+		if stale then
+			startPathfind(target)
+		end
+	end
+
+	-- stuck detection
+	if t - nav.progT > 1.5 then
+		local moved = (pos - nav.progPos).Magnitude
+		if nav.path and not nav.busy and moved < 2.5 then
+			nav.stuck += 1
+			nav.marginBonus = math.min(nav.marginBonus + 30, 120)
+			nav.path = nil
+		elseif moved >= 2.5 then
+			nav.stuck = 0
+		end
+		nav.progPos, nav.progT = pos, t
+	end
+
+	local path = nav.path
+	if not path then
+		return nil
+	end
+
+	while path[nav.idx] and (path[nav.idx] - pos).Magnitude < CONFIG.WaypointRadius do
+		nav.idx += 1
+	end
+	-- cut corners whenever the next waypoint is already visible
+	if t - nav.lastSkip > 0.15 and path[nav.idx + 1] then
+		nav.lastSkip = t
+		if clearLine(pos, path[nav.idx + 1]) then
+			nav.idx += 1
+		end
+	end
+
+	local wp = path[nav.idx] or target
+	local toWp = wp - pos
+	local d = toWp.Magnitude
+	if d < 0.01 then
+		return Vector3.zero
+	end
+	local speed = maxSpeed
+	local nxt = path[nav.idx + 1]
+	if nxt then
+		local seg = nxt - wp
+		if seg.Magnitude > 0.1 then
+			local turn = 1 - (toWp.Unit:Dot(seg.Unit) + 1) / 2
+			speed = speed * (1 - turn * 0.65 * math.clamp(1 - d / 24, 0, 1))
+		end
+	else
+		speed = speed * math.clamp(d / 25, 0.3, 1)
+	end
+	return toWp.Unit * speed
+end
+
+----------------------------------------------------------------------
+-- Follow / parked / recall behaviour
+----------------------------------------------------------------------
+local function getRoot()
+	local c = player.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function followTarget(root, t)
+	local rl = root.CFrame.LookVector
+	local flat = Vector3.new(rl.X, 0, rl.Z)
+	flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+	local right = flat:Cross(Vector3.yAxis)
+	local bob = math.sin(t * 1.7) * 0.35
+
+	local target = root.Position
+		- flat * CONFIG.FollowDistance
+		+ right * CONFIG.FollowSide
+		+ Vector3.new(0, CONFIG.FollowHeight + bob, 0)
+
+	rayParams.FilterDescendantsInstances = { model, root.Parent }
+	local hit = Workspace:Raycast(root.Position, target - root.Position, rayParams)
+	if hit then
+		target = hit.Position + hit.Normal * 1.2
+	end
+	return target, rl
+end
+
+local function turnTo(wantYaw, dt, rate)
+	local diff = ((wantYaw - yaw + math.pi) % (math.pi * 2)) - math.pi
+	yaw += diff * (1 - math.exp(-dt * rate))
+end
+
+local function hover(dt, t, allowLand)
+	pitch += (CONFIG.FollowPitch - pitch) * (1 - math.exp(-dt * 3))
+	if allowLand and CONFIG.AutoLand then
+		local gap = groundGap()
+		if land.landed and gap > 0.6 then
+			land.landed = false
+		end
+		if not land.landed and gap < CONFIG.LandHeight then
+			land.landing = true
+		end
+		if land.landed then
+			vel = Vector3.zero
+			return
+		elseif land.landing then
+			settleDown(dt, gap)
+			return
+		end
+	end
+	local desired = Vector3.new(0, math.cos(t * 1.7) * 0.6, 0)
+	vel = vel:Lerp(desired, 1 - math.exp(-dt * 3))
+	integrate(dt)
+end
+
+local function recallStep(dt, root)
+	local t = os.clock()
+	local target = followTarget(root, t)
+	local dist = (target - pos).Magnitude
+
+	if dist < CONFIG.RecallArrive then
+		dropPath()
+		nav.marginBonus = 0
+		fstate = "follow"
+		return
+	end
+	if t - nav.recallStart > CONFIG.RecallTimeout then
+		dropPath()
+		pos, vel = target, Vector3.zero
+		fstate = "follow"
+		return
+	end
+
+	pathParams.FilterDescendantsInstances = { model, root.Parent }
+	if t - nav.lastDirect > 0.12 then
+		nav.lastDirect = t
+		nav.direct = clearLine(pos, target)
+	end
+
+	local desired
+	if nav.direct then
+		if nav.path or nav.busy then
+			dropPath()
+		end
+		desired = (target - pos).Unit * CONFIG.RecallSpeed * math.clamp(dist / 25, 0.3, 1)
+	else
+		desired = pathDesired(dt, target, CONFIG.RecallSpeed)
+		if nav.stuck >= 3 then
+			dropPath()
+			pos, vel = target, Vector3.zero
+			fstate = "follow"
+			return
+		end
+	end
+
+	vel = vel:Lerp(desired or Vector3.zero, 1 - math.exp(-dt * 8))
+	integrate(dt)
+
+	local fv = Vector3.new(vel.X, 0, vel.Z)
+	if fv.Magnitude > 4 then
+		turnTo(math.atan2(-fv.X, -fv.Z), dt, 6)
+	end
+	pitch += (CONFIG.FollowPitch - pitch) * (1 - math.exp(-dt * 3))
+end
+
+local function followStep(dt, root)
+	local t = os.clock()
+
+	if not root or fstate == "parked" then
+		hover(dt, t, root ~= nil and fstate == "parked")
+		return
+	end
+
+	-- after a landing, wait for the rotors to spool back up
+	if land.power < 0.55 then
+		vel = vel:Lerp(Vector3.zero, 1 - math.exp(-dt * 6))
+		return
+	end
+
+	if fstate == "recall" then
+		recallStep(dt, root)
+		return
+	end
+
+	local target, rl = followTarget(root, t)
+
+	turnTo(math.atan2(-rl.X, -rl.Z), dt, 3)
+	pitch += (CONFIG.FollowPitch - pitch) * (1 - math.exp(-dt * 3))
+
+	if (target - pos).Magnitude > CONFIG.FollowLeash then
+		pos = target
+		vel = Vector3.zero
+		dropPath()
+		return
+	end
+
+	-- If a wall is between us and the player for a moment, path around it
+	pathParams.FilterDescendantsInstances = { model, root.Parent }
+	if t - nav.lastDirect > 0.15 then
+		nav.lastDirect = t
+		nav.direct = clearLine(pos, target)
+		nav.blocked = nav.direct and 0 or (nav.blocked + 0.15)
+	end
+	if not nav.direct and nav.blocked > 0.7 and (target - pos).Magnitude > 8 then
+		if not nav.active then
+			nav.active = true
+			nav.progPos, nav.progT, nav.stuck = pos, t, 0
+		end
+		local desired = pathDesired(dt, target, CONFIG.FollowMaxSpeed)
+		vel = vel:Lerp(desired or Vector3.zero, 1 - math.exp(-dt * 6))
+		integrate(dt)
+		local fv = Vector3.new(vel.X, 0, vel.Z)
+		if fv.Magnitude > 4 then
+			turnTo(math.atan2(-fv.X, -fv.Z), dt, 5)
+		end
+		if nav.stuck >= 3 then
+			nav.stuck = 0
+		end
+		return
+	elseif nav.active then
+		nav.active = false
+		dropPath()
+	end
+
+	local desired = (target - pos) * CONFIG.FollowGain + root.AssemblyLinearVelocity
+	if desired.Magnitude > CONFIG.FollowMaxSpeed then
+		desired = desired.Unit * CONFIG.FollowMaxSpeed
+	end
+	vel = vel:Lerp(desired, 1 - math.exp(-dt * 5))
+	integrate(dt)
+end
+
+function startRecall()
+	if mode ~= "follow" or fstate ~= "parked" then
+		return
+	end
+	dropPath()
+	fstate = "recall"
+	land.landed, land.landing = false, false
+	nav.recallStart = os.clock()
+	nav.progPos, nav.progT, nav.stuck = pos, os.clock(), 0
+	nav.direct, nav.lastDirect, nav.marginBonus = false, 0, 0
+end
+
+----------------------------------------------------------------------
+-- Pilot input + movement
+----------------------------------------------------------------------
+local function key(k)
+	return UserInputService:IsKeyDown(k)
+end
+
+local function connectPilotInput()
+	pilotConns[#pilotConns + 1] = UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Touch then
+			if not lookTouch then
+				lookTouch = input
+			end
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			rmbDown = true
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+		elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+			held.fire = true
+		elseif input.KeyCode == Enum.KeyCode.V then
+			toggleCam()
+		end
+	end)
+
+	pilotConns[#pilotConns + 1] = UserInputService.InputChanged:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			if input == lookTouch then
+				yaw -= input.Delta.X * CONFIG.TouchSensitivity * sens
+				pitch = math.clamp(pitch - input.Delta.Y * CONFIG.TouchSensitivity * sens, -CONFIG.MaxPitch, CONFIG.MaxPitch)
+			end
+		elseif input.UserInputType == Enum.UserInputType.MouseMovement then
+			if rmbDown then
+				yaw -= input.Delta.X * CONFIG.MouseSensitivity
+				pitch = math.clamp(pitch - input.Delta.Y * CONFIG.MouseSensitivity, -CONFIG.MaxPitch, CONFIG.MaxPitch)
+			end
+		end
+	end)
+
+	pilotConns[#pilotConns + 1] = UserInputService.InputEnded:Connect(function(input)
+		if input == lookTouch then
+			lookTouch = nil
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			rmbDown = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+			held.fire = false
+		end
+	end)
+end
+
+local function pilotStep(dt)
+	local typing = UserInputService:GetFocusedTextBox() ~= nil
+	local locked = exiting
+	local function k(code)
+		return not locked and not typing and key(code)
+	end
+	local function hd(name)
+		return not locked and held[name]
+	end
+	local f = (hd("fwd") or k(Enum.KeyCode.W)) and 1 or 0
+	local b = (hd("back") or k(Enum.KeyCode.S)) and 1 or 0
+	local l = (hd("left") or k(Enum.KeyCode.A)) and 1 or 0
+	local r = (hd("right") or k(Enum.KeyCode.D)) and 1 or 0
+	local u = (hd("up") or k(Enum.KeyCode.Space) or k(Enum.KeyCode.E)) and 1 or 0
+	local d = (hd("down") or k(Enum.KeyCode.Q) or k(Enum.KeyCode.LeftControl)) and 1 or 0
+	local boosting = boostOn or k(Enum.KeyCode.LeftShift)
+	local boost = boosting and CONFIG.Boost or 1
+
+	local moveInput = (f + b + l + r + u + d) > 0
+	local gap = groundGap()
+
+	-- Landing logic: stop moving near the ground -> settle down -> rotors spin down
+	if land.landed and gap > 0.6 then
+		land.landed = false
+	end
+	if moveInput then
+		land.idle = 0
+		land.landing = false
+		land.landed = false
+	else
+		land.idle += dt
+		if CONFIG.AutoLand and not land.landed and not land.landing and land.idle > CONFIG.LandDelay
+			and gap < CONFIG.LandHeight and vel.Magnitude < 4 then
+			land.landing = true
+		end
+	end
+
+	if land.landed then
+		vel = Vector3.zero
+		return
+	elseif land.landing then
+		settleDown(dt, gap)
+		return
+	end
+
+	local look = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
+	local dir = look.LookVector * (f - b) + look.RightVector * (r - l) + Vector3.new(0, u - d, 0)
+	if dir.Magnitude > 0 then
+		dir = dir.Unit
+	end
+	-- can't lift off until the rotors have spun up
+	if land.power < 0.6 then
+		dir = Vector3.zero
+	end
+
+	vel = vel:Lerp(dir * CONFIG.Speed * boost, 1 - math.exp(-dt * CONFIG.Smoothing))
+	integrate(dt)
+end
+
+----------------------------------------------------------------------
+-- Mode transitions
+----------------------------------------------------------------------
+function cleanup(keepHandoff)
+	if destroyed then
+		return
+	end
+	destroyed = true
+	if keepHandoff then
+		env.__DroneHandoff = { pos = pos, lightMode = lightMode, sens = sens, soundLevel = soundLevel }
+	else
+		env.__DroneHandoff = nil
+	end
+	dropPath()
+	pcall(function()
+		RunService:UnbindFromRenderStep("DroneStep")
+	end)
+	for _, c in ipairs(conns) do
+		c:Disconnect()
+	end
+	for _, c in ipairs(pilotConns) do
+		c:Disconnect()
+	end
+	releasePlayer()
+	model:Destroy()
+	marker:Destroy()
+	if gui then
+		gui:Destroy()
+	end
+	destroyFollowUI()
+	env.__DroneCleanup = nil
+end
+env.__DroneCleanup = function()
+	cleanup(true)
+end
+
+function finishExit()
+	if mode ~= "pilot" then
+		return
+	end
+	mode = "follow"
+	exiting = true
+	for k in pairs(held) do
+		held[k] = false
+	end
+	lookTouch, rmbDown = nil, false
+	sensDrag = nil
+	for _, c in ipairs(pilotConns) do
+		c:Disconnect()
+	end
+	table.clear(pilotConns)
+	releasePlayer()
+	if gui then
+		gui:Destroy()
+		gui = nil
+	end
+
+	dropPath()
+	nav.active = false
+	local root = getRoot()
+	if root and (pos - root.Position).Magnitude > CONFIG.ParkDistance then
+		fstate = "parked"
+	else
+		fstate = "follow"
+		land.landed, land.landing = false, false
+	end
+	buildFollowUI()
+end
+
+function enterPilot()
+	if mode ~= "follow" or destroyed then
+		return
+	end
+	mode = "pilot"
+	exiting = false
+	dropPath()
+	nav.active = false
+	fstate = "follow"
+	land.landing = false
+	land.idle = 0
+	destroyFollowUI()
+	marker.Enabled = false
+
+	camera = Workspace.CurrentCamera
+	savedFov = camera.FieldOfView
+	fov = CONFIG.DefaultFOV
+	zoomIndex = 1
+	fovBoost = 0
+	startTime = os.clock()
+	hudTimer = 0
+
+	lockPlayer()
+	connectPilotInput()
+	buildPilotUI()
+end
+
+function exitDrone()
+	if exiting or destroyed or mode ~= "pilot" then
+		return
+	end
+	exiting = true
+	for k in pairs(held) do
+		held[k] = false
+	end
+	for i, g in ipairs(groups) do
+		task.delay(0.03 * i, function()
+			if not destroyed and g.frame.Parent then
+				tween(g.frame, SLIDE_OUT, { Position = g.start })
+			end
+		end)
+	end
+	if reticle then
+		tween(reticle, TweenInfo.new(0.25), { Size = UDim2.fromOffset(60, 60) })
+	end
+	task.delay(0.55, function()
+		if destroyed or mode ~= "pilot" then
+			return
+		end
+		finishExit()
+	end)
+end
+
+----------------------------------------------------------------------
+-- Main step
+----------------------------------------------------------------------
+local function step(dt)
+	if destroyed then
+		return
+	end
+	camera = Workspace.CurrentCamera
+
+	local character = player.Character
+	local h = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+
+	if mode == "pilot" then
+		if not h or h.Health <= 0 then
+			finishExit()
+		else
+			pilotStep(dt)
+		end
+	end
+	if mode == "follow" then
+		if h and h.Health <= 0 then
+			root = nil
+		end
+		followStep(dt, root)
+	end
+
+	local yawCF = CFrame.Angles(0, yaw, 0)
+	local look = yawCF * CFrame.Angles(pitch, 0, 0)
+	local lv = yawCF:VectorToObjectSpace(vel)
+	local fwdFrac = math.clamp(-lv.Z / CONFIG.Speed, -1.5, 1.5)
+	local rightFrac = math.clamp(lv.X / CONFIG.Speed, -1.5, 1.5)
+	local bodyCF = CFrame.new(pos) * yawCF
+		* CFrame.Angles(-fwdFrac * CONFIG.MaxTilt * 0.7, 0, -rightFrac * CONFIG.MaxTilt * 0.7)
+
+	-- Rotor power: spins up quickly, spins down slowly and stops once landed
+	local rotorTarget = land.landed and 0 or 1
+	local rate = rotorTarget > land.power and CONFIG.RotorSpinUp or CONFIG.RotorSpinDown
+	land.power += (rotorTarget - land.power) * (1 - math.exp(-dt * rate))
+	if rotorTarget == 0 and land.power < 0.025 then
+		land.power = 0
+	end
+
+	local effort = math.clamp(vel.Magnitude / CONFIG.Speed, 0, 2)
+	local rotorSpeed = (35 + effort * 22) * land.power
+	for _, disc in ipairs(discs) do
+		disc.Transparency = 1 - land.power * (0.09 + math.min(effort, 1) * 0.07)
+	end
+
+	local gimbalCF = CFrame.new((bodyCF * GIMBAL_REL).Position) * look
+
+	local n = 0
+	for _, s in ipairs(statics) do
+		n += 1
+		allCFs[n] = bodyCF * s[2]
+	end
+	for _, ro in ipairs(rotors) do
+		ro.angle = (ro.angle + rotorSpeed * dt * ro.dir) % (math.pi * 2)
+		local base = bodyCF * ro.rel * CFrame.Angles(0, ro.angle, 0)
+		for _, bp in ipairs(ro.parts) do
+			n += 1
+			allCFs[n] = base * bp[2]
+		end
+	end
+	for _, g in ipairs(gimbalParts) do
+		n += 1
+		allCFs[n] = gimbalCF * g[2]
+	end
+	Workspace:BulkMoveTo(allParts, allCFs, Enum.BulkMoveMode.FireCFrameChanged)
+
+	local t = os.clock()
+	local ph = t % 1.4
+	local strobeOn = lightMode >= 1 and (ph < 0.07 or (ph > 0.18 and ph < 0.25))
+	local beaconOn = lightMode >= 1 and (t % 1.0) < 0.45
+	for _, led in ipairs(navLeds) do
+		if led.kind == "strobe" or led.kind == "beacon" then
+			local on = (led.kind == "strobe") and strobeOn or beaconOn
+			led.part.Material = on and Enum.Material.Neon or Enum.Material.SmoothPlastic
+		end
+	end
+
+	updateBullets(dt)
+	updateFlashes(dt)
+
+	if mode == "follow" then
+		followUiTimer += dt
+		if followUiTimer > 0.1 then
+			followUiTimer = 0
+			local dist = root and (pos - root.Position).Magnitude or 0
+			local away = fstate ~= "follow"
+			local showMarker = away and dist > 15
+			marker.Enabled = showMarker
+			if showMarker then
+				markerLabel.Text = string.format("DRONE  %d", dist)
+			end
+			if followGui then
+				setRecallVisible(away)
+				if recallBtn then
+					setSub(recallBtn, fstate == "recall" and "EN ROUTE" or string.format("%d studs", dist))
+					setActive(recallBtn, fstate == "recall")
+				end
+			end
+		end
+		return
+	end
+
+	-- Pilot camera + HUD
+	local speedFrac = math.clamp(vel.Magnitude / (CONFIG.Speed * CONFIG.Boost), 0, 1)
+	fovBoost = fovBoost + (speedFrac * 8 - fovBoost) * (1 - math.exp(-dt * 5))
+
+	gun.shake = gun.shake * math.exp(-dt * 12)
+	local sh = CFrame.Angles((math.random() - 0.5) * 0.008 * gun.shake, (math.random() - 0.5) * 0.008 * gun.shake, 0)
+
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.FieldOfView = math.clamp(fov + fovBoost, 20, 120)
+	if firstPerson then
+		camera.CFrame = gimbalCF * CFrame.new(0, 0, -0.85) * CFrame.Angles(0, 0, -rightFrac * 0.1) * sh
+	else
+		local pivot = CFrame.new(bodyCF.Position) * look
+		local want = pivot * CFrame.new(0, 1.5, CONFIG.ChaseDistance)
+		rayParams.FilterDescendantsInstances = { model, player.Character }
+		local hit = Workspace:Raycast(pivot.Position, want.Position - pivot.Position, rayParams)
+		local camPos = hit and (hit.Position + hit.Normal * 0.4) or want.Position
+		camera.CFrame = CFrame.new(camPos) * look.Rotation * sh
+	end
+
+	gun.timer = math.max(gun.timer - dt, 0)
+	local typing = UserInputService:GetFocusedTextBox() ~= nil
+	local wantFire = not exiting and (held.fire or (not typing and key(CONFIG.FireKey)))
+	if fireBtn and fireBtn.Parent then
+		setActive(fireBtn, wantFire)
+	end
+	if wantFire and gun.timer <= 0 then
+		gun.timer = CONFIG.FireRate
+		fireShot(gimbalCF)
+	end
+
+	if recDot then
+		recDot.BackgroundTransparency = (math.sin(t * 5) > 0) and 0 or 0.75
+		hudTimer += dt
+		if hudTimer > 0.1 then
+			hudTimer = 0
+			local elapsed = math.floor(t - startTime)
+			recLabel.Text = string.format("%02d:%02d", math.floor(elapsed / 60), elapsed % 60)
+			altLabel.Text = string.format("ALT %d", math.floor(pos.Y))
+			if land.landed then
+				spdLabel.Text = "LANDED"
+			elseif land.landing then
+				spdLabel.Text = "LANDING"
+			else
+				spdLabel.Text = string.format("SPD %d", math.floor(vel.Magnitude))
+			end
+			hdgLabel.Text = string.format("HDG %d", math.floor((-math.deg(yaw)) % 360))
+			updateZoomUI()
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Start
+----------------------------------------------------------------------
+lockPlayer()
+buildPilotUI()
+connectPilotInput()
+
+conns[#conns + 1] = Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+	applyScale(groups)
+	applyScale(fgroups)
+end)
+
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or UserInputService:GetFocusedTextBox() then
+		return
+	end
+	if input.KeyCode == CONFIG.LightKey then
+		cycleLights()
+	end
+end)
+
+RunService:BindToRenderStep("DroneStep", Enum.RenderPriority.Camera.Value + 1, step)
+]=]
+
+local fn, err = loadstring(src)
+if not fn then
+	warn("Drone failed to compile: " .. tostring(err))
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Drone", Text = tostring(err):sub(1, 180), Duration = 10 })
+	end)
+else
+	local ok, e = pcall(fn)
+	if not ok then
+		warn("Drone error: " .. tostring(e))
+		pcall(function()
+			game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Drone", Text = tostring(e):sub(1, 180), Duration = 10 })
+		end)
+	end
+end
